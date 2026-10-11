@@ -425,7 +425,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
         }
         messageList = column()
-        scrollView!!.addView(messageList, ScrollView.LayoutParams(-1, -2))
+        scrollView!!.addView(messageList, ViewGroup.LayoutParams(-1, -2))
         root.addView(scrollView, LinearLayout.LayoutParams(-1, 0, 1f))
 
         val composerArea = column().apply {
@@ -802,7 +802,7 @@ class MainActivity : Activity() {
     private fun field(hintText: String): EditText = EditText(this).apply {
         hint = hintText; setHintTextColor(Palette.MUTED); setTextColor(Palette.WHITE); textSize = 14f
         background = rounded(Palette.PANEL, 14, Palette.BORDER); setPadding(dp(14), dp(12), dp(14), dp(12))
-        singleLine = true
+        setSingleLine(true)
     }
 
     private fun smallButton(label: String, accent: Boolean = false, click: () -> Unit): TextView = text(label, 10, if (accent) Palette.BG else Palette.WHITE, true).apply {
