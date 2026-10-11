@@ -1,0 +1,48 @@
+name: Prepare Berdua source from ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check and unpack source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "berdua-source.zip" ]; then
+            echo "Missing berdua-source.zip in repository root. Upload the ZIP first."
+            exit 1
+          fi
+          mkdir -p /tmp/berdua-source
+          unzip -q berdua-source.zip -d /tmp/berdua-source
+          if [ ! -f /tmp/berdua-source/berdua-android/settings.gradle.kts ] || [ ! -f /tmp/berdua-source/berdua-android/app/build.gradle.kts ]; then
+            echo "ZIP structure invalid: expected berdua-android/settings.gradle.kts and berdua-android/app/build.gradle.kts inside the archive."
+            echo "Archive listing:"
+            unzip -l berdua-source.zip
+            exit 1
+          fi
+          rsync -a --delete --exclude='.github/' /tmp/berdua-source/berdua-android/ ./
+          rm -f berdua-source.zip
+
+      - name: Commit source files to repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No source changes to commit."
+          else
+            git commit -m "Prepare Berdua Android source from ZIP"
+            git push
+          fi
+          
