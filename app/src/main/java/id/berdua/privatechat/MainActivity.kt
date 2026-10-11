@@ -32,6 +32,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import java.io.File
 import java.io.IOException
 import java.security.SecureRandom
@@ -47,7 +48,80 @@ private const val REQ_SAVE_MEDIA = 2102
 private const val REQ_MIC = 2103
 private const val REQ_LOCATION = 2104
 private const val REQ_NOTIFICATIONS = 2105
-private const val MAX_ATTACHMENT_BYTES = 900_000
+private const val MAX_ATTACHMENT_BYTES = 80L * 1024L * 1024L // 80 MiB per file
+
+private fun copyWithLimit(
+    input: java.io.InputStream,
+    destination: File
+): Long {
+    destination.parentFile?.let {
+        if (!it.exists() && !it.mkdirs()) {
+            throw IOException("Penyimpanan lampiran tidak tersedia")
+        }
+    }
+
+    var total = 0L
+    val buffer = ByteArray(64 * 1024)
+
+    try {
+        destination.outputStream().buffered().use { output ->
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+
+                total += count.toLong()
+                if (total > MAX_ATTACHMENT_BYTES) {
+                    throw IOException("Lampiran maksimal 80 MiB per file")
+                }
+                output.write(buffer, 0, count)
+            }
+        }
+        return total
+    } catch (e: Exception) {
+        destination.delete()
+        throw e
+    }
+}
+
+private fun copyExactlyWithLimit(
+    input: java.io.InputStream,
+    destination: File,
+    expectedLength: Long
+): Long {
+    if (expectedLength < 0L || expectedLength > MAX_ATTACHMENT_BYTES) {
+        throw IOException("Lampiran maksimal 80 MiB per file")
+    }
+
+    destination.parentFile?.let {
+        if (!it.exists() && !it.mkdirs()) {
+            throw IOException("Penyimpanan lampiran tidak tersedia")
+        }
+    }
+
+    var remaining = expectedLength
+    var total = 0L
+    val buffer = ByteArray(64 * 1024)
+
+    try {
+        destination.outputStream().buffered().use { output ->
+            while (remaining > 0L) {
+                val wanted = minOf(buffer.size.toLong(), remaining).toInt()
+                val count = input.read(buffer, 0, wanted)
+                if (count < 0) {
+                    throw IOException("Unggahan terputus sebelum selesai")
+                }
+                if (count == 0) continue
+                output.write(buffer, 0, count)
+                total += count.toLong()
+                remaining -= count.toLong()
+            }
+        }
+        return total
+    } catch (e: Exception) {
+        destination.delete()
+        throw e
+    }
+}
 
 private object Palette {
     const val BG = 0xFF050505.toInt()
@@ -130,59 +204,206 @@ class LocalChatServer(
     private val pairCode: String,
     private val store: MessageStore
 ) : NanoHTTPD("0.0.0.0", PORT) {
-    private val prefs = context.getSharedPreferences("berdua_pairing", Context.MODE_PRIVATE)
+
+    private val prefs = context.getSharedPreferences(
+        "berdua_pairing", Context.MODE_PRIVATE
+    )
+
+    private fun attachmentDirectory(): File {
+        return File(context.filesDir, "attachments").apply {
+            if (!exists() && !mkdirs()) {
+                throw IOException("Tidak bisa membuat folder lampiran")
+            }
+        }
+    }
 
     override fun serve(session: IHTTPSession): Response {
         val path = session.uri
         val method = session.method
         val suppliedCode = session.headers["x-pair-code"].orEmpty()
-        if (suppliedCode != pairCode) return json(Response.Status.UNAUTHORIZED, "{\"error\":\"Kode pasangan salah\"}")
+
+        if (suppliedCode != pairCode) {
+            return json(
+                Response.Status.UNAUTHORIZED,
+                """{"error":"Kode pasangan salah"}"""
+            )
+        }
 
         if (path == "/api/pair" && method == Method.POST) {
             val body = readBody(session)
-            val remoteId = try { JSONObject(body).optString("deviceId") } catch (_: Exception) { "" }
-            if (remoteId.length < 12) return json(Response.Status.BAD_REQUEST, "{\"error\":\"deviceId tidak valid\"}")
+            val remoteId = try {
+                JSONObject(body).optString("deviceId")
+            } catch (_: Exception) {
+                ""
+            }
+
+            if (remoteId.length < 12) {
+                return json(
+                    Response.Status.BAD_REQUEST,
+                    """{"error":"deviceId tidak valid"}"""
+                )
+            }
+
             synchronized(prefs) {
-                val existing = prefs.getString("paired_device_id", "").orEmpty()
+                val existing = prefs.getString(
+                    "paired_device_id", ""
+                ).orEmpty()
                 if (existing.isNotEmpty() && existing != remoteId) {
-                    return json(Response.Status.FORBIDDEN, "{\"error\":\"Sudah ada satu perangkat kedua yang dipasangkan\"}")
+                    return json(
+                        Response.Status.FORBIDDEN,
+                        """{"error":"Sudah ada satu perangkat kedua yang dipasangkan"}"""
+                    )
                 }
                 prefs.edit().putString("paired_device_id", remoteId).apply()
             }
-            return json(Response.Status.OK, "{\"ok\":true,\"message\":\"Perangkat dipasangkan\"}")
+
+            return json(
+                Response.Status.OK,
+                """{"ok":true,"message":"Perangkat dipasangkan"}"""
+            )
         }
 
         val remoteId = session.headers["x-device-id"].orEmpty()
-        val pairedId = prefs.getString("paired_device_id", "").orEmpty()
+        val pairedId = prefs.getString(
+            "paired_device_id", ""
+        ).orEmpty()
         if (pairedId.isEmpty() || remoteId != pairedId) {
-            return json(Response.Status.FORBIDDEN, "{\"error\":\"Perangkat belum dipasangkan\"}")
+            return json(
+                Response.Status.FORBIDDEN,
+                """{"error":"Perangkat belum dipasangkan"}"""
+            )
         }
 
         return when {
-            path == "/api/health" && method == Method.GET -> json(Response.Status.OK, "{\"active\":true}")
+            path.startsWith("/api/attachments/") && method == Method.PUT ->
+                receiveAttachment(session, path.substringAfterLast('/'))
+
+            path.startsWith("/api/attachments/") && method == Method.GET ->
+                serveAttachment(path.substringAfterLast('/'))
+
+            path == "/api/health" && method == Method.GET ->
+                json(Response.Status.OK, """{"active":true}""")
+
             path == "/api/messages" && method == Method.GET -> {
                 val array = JSONArray()
                 store.all().forEach { array.put(it.toJson()) }
                 json(Response.Status.OK, array.toString())
             }
+
             path == "/api/messages" && method == Method.POST -> {
                 val body = readBody(session)
                 try {
                     val message = ChatMessage.fromJson(JSONObject(body))
                     if (message.id <= 0 || message.senderId != remoteId) {
-                        return json(Response.Status.BAD_REQUEST, "{\"error\":\"Pesan tidak valid\"}")
+                        return json(
+                            Response.Status.BAD_REQUEST,
+                            """{"error":"Pesan tidak valid"}"""
+                        )
                     }
                     if (message.data.length > 1_300_000) {
-                        return json(Response.Status.PAYLOAD_TOO_LARGE, "{\"error\":\"Lampiran terlalu besar\"}")
+                        return json(
+                            Response.Status.PAYLOAD_TOO_LARGE,
+                            """{"error":"Data pesan terlalu besar"}"""
+                        )
                     }
                     store.upsert(message)
-                    json(Response.Status.OK, "{\"ok\":true}")
+                    json(Response.Status.OK, """{"ok":true}""")
                 } catch (_: Exception) {
-                    json(Response.Status.BAD_REQUEST, "{\"error\":\"JSON tidak valid\"}")
+                    json(
+                        Response.Status.BAD_REQUEST,
+                        """{"error":"JSON tidak valid"}"""
+                    )
                 }
             }
-            else -> json(Response.Status.NOT_FOUND, "{\"error\":\"Tidak ditemukan\"}")
+
+            else -> json(
+                Response.Status.NOT_FOUND,
+                """{"error":"Tidak ditemukan"}"""
+            )
         }
+    }
+
+    private fun receiveAttachment(session: IHTTPSession, id: String): Response {
+        if (!id.matches(Regex("[a-f0-9]{32}"))) {
+            return json(
+                Response.Status.BAD_REQUEST,
+                """{"error":"ID lampiran tidak valid"}"""
+            )
+        }
+
+        val declaredLength = session.headers["content-length"]?.toLongOrNull()
+        if (declaredLength == null || declaredLength < 0L) {
+            return json(
+                Response.Status.LENGTH_REQUIRED,
+                """{"error":"Content-Length diperlukan untuk unggahan lampiran"}"""
+            )
+        }
+        if (declaredLength > MAX_ATTACHMENT_BYTES) {
+            return json(
+                Response.Status.PAYLOAD_TOO_LARGE,
+                """{"error":"Lampiran maksimal 80 MiB per file"}"""
+            )
+        }
+
+        val directory = try {
+            attachmentDirectory()
+        } catch (e: Exception) {
+            return json(
+                Response.Status.INTERNAL_ERROR,
+                """{"error":"Penyimpanan lampiran tidak tersedia"}"""
+            )
+        }
+
+        val target = File(directory, "$id.bin")
+        val staging = File(directory, "$id.uploading")
+        return try {
+            // Baca tepat sebanyak Content-Length; jangan menunggu EOF pada koneksi keep-alive.
+            copyExactlyWithLimit(session.inputStream, staging, declaredLength)
+
+            if (target.exists() && !target.delete()) {
+                throw IOException("Tidak bisa mengganti lampiran lama")
+            }
+            if (!staging.renameTo(target)) {
+                staging.copyTo(target, overwrite = true)
+                staging.delete()
+            }
+
+            json(Response.Status.OK, """{"ok":true}""")
+        } catch (e: Exception) {
+            staging.delete()
+            val tooLarge = (e.message ?: "").contains("80 MiB")
+            json(
+                if (tooLarge) Response.Status.PAYLOAD_TOO_LARGE
+                else Response.Status.BAD_REQUEST,
+                JSONObject().put(
+                    "error", e.message ?: "Upload lampiran gagal"
+                ).toString()
+            )
+        }
+    }
+
+    private fun serveAttachment(id: String): Response {
+        if (!id.matches(Regex("[a-f0-9]{32}"))) {
+            return json(
+                Response.Status.BAD_REQUEST,
+                """{"error":"ID lampiran tidak valid"}"""
+            )
+        }
+
+        val file = File(attachmentDirectory(), "$id.bin")
+        if (!file.isFile) {
+            return json(
+                Response.Status.NOT_FOUND,
+                """{"error":"Lampiran tidak ditemukan"}"""
+            )
+        }
+
+        return newFixedLengthResponse(
+            Response.Status.OK,
+            "application/octet-stream",
+            file.inputStream().buffered(),
+            file.length()
+        ).apply { addHeader("Cache-Control", "no-store") }
     }
 
     private fun readBody(session: IHTTPSession): String {
@@ -192,15 +413,18 @@ class LocalChatServer(
     }
 
     private fun json(status: Response.IStatus, body: String): Response =
-        newFixedLengthResponse(status, "application/json; charset=utf-8", body).apply {
-            addHeader("Cache-Control", "no-store")
-        }
+        newFixedLengthResponse(
+            status, "application/json; charset=utf-8", body
+        ).apply { addHeader("Cache-Control", "no-store") }
 }
 
 class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
-    private val http = OkHttpClient.Builder().connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS).writeTimeout(8, TimeUnit.SECONDS).build()
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .writeTimeout(5, TimeUnit.MINUTES)
+        .build()
     private val prefs by lazy { getSharedPreferences("berdua_app", MODE_PRIVATE) }
     private val deviceId by lazy {
         prefs.getString("device_id", null) ?: (java.util.UUID.randomUUID().toString().replace("-", "").also {
@@ -425,7 +649,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
         }
         messageList = column()
-        scrollView!!.addView(messageList, ViewGroup.LayoutParams(-1, -2))
+        scrollView!!.addView(messageList, ScrollView.LayoutParams(-1, -2))
         root.addView(scrollView, LinearLayout.LayoutParams(-1, 0, 1f))
 
         val composerArea = column().apply {
@@ -591,16 +815,110 @@ class MainActivity : Activity() {
     }
 
     private fun sendPickedFile(uri: Uri) {
+        val attachmentType = pendingMediaType
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
         Thread {
+            val destination = try {
+                File(attachmentDirectory(), "$id.bin")
+            } catch (_: Exception) {
+                runOnUiThread { toast("Penyimpanan lampiran tidak tersedia") }
+                return@Thread
+            }
+
             try {
-                val mime = contentResolver.getType(uri) ?: if (pendingMediaType == "video") "video/mp4" else "image/jpeg"
-                val bytes = contentResolver.openInputStream(uri)?.use { input -> readLimited(input, MAX_ATTACHMENT_BYTES + 1) } ?: throw IOException("File tidak terbaca")
-                if (bytes.size > MAX_ATTACHMENT_BYTES) throw IOException("Lampiran maksimal ${MAX_ATTACHMENT_BYTES / 1000} KB pada build awal")
-                val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                val msg = ChatMessage(System.currentTimeMillis(), deviceId, pendingMediaType, "", mime, b64)
-                runOnUiThread { sendMessage(msg) }
-            } catch (e: Exception) { runOnUiThread { toast(e.message ?: "Tidak bisa membaca lampiran") } }
+                val mime = contentResolver.getType(uri)
+                    ?: if (attachmentType == "video") "video/mp4" else "image/jpeg"
+                val input = contentResolver.openInputStream(uri)
+                    ?: throw IOException("File tidak terbaca")
+                input.use { copyWithLimit(it, destination) }
+                transferAttachment(destination, id, attachmentType, mime)
+            } catch (e: Exception) {
+                destination.delete()
+                runOnUiThread {
+                    toast(e.message ?: "Tidak bisa membaca lampiran")
+                }
+            }
         }.start()
+    }
+
+    private fun sendLocalAttachment(
+        source: File,
+        type: String,
+        mime: String,
+        deleteSource: Boolean = false
+    ) {
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
+        Thread {
+            val destination = try {
+                File(attachmentDirectory(), "$id.bin")
+            } catch (_: Exception) {
+                runOnUiThread { toast("Penyimpanan lampiran tidak tersedia") }
+                return@Thread
+            }
+
+            try {
+                source.inputStream().buffered().use {
+                    copyWithLimit(it, destination)
+                }
+                if (deleteSource) source.delete()
+                transferAttachment(destination, id, type, mime)
+            } catch (e: Exception) {
+                destination.delete()
+                runOnUiThread {
+                    toast(e.message ?: "Tidak bisa menyiapkan lampiran")
+                }
+            }
+        }.start()
+    }
+
+    private fun transferAttachment(
+        file: File,
+        id: String,
+        type: String,
+        mime: String
+    ) {
+        try {
+            if (mode != "host" && mode != "client") {
+                throw IOException("Sambungkan chat dulu")
+            }
+
+            if (mode == "client") {
+                val request = Request.Builder()
+                    .url("$serverUrl/api/attachments/$id")
+                    .header("x-pair-code", pairCode)
+                    .header("x-device-id", deviceId)
+                    .put(file.asRequestBody(mime.toMediaType()))
+                    .build()
+
+                http.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        throw IOException(
+                            response.body?.string()
+                                ?: "Upload gagal (HTTP ${response.code})"
+                        )
+                    }
+                }
+            }
+
+            val message = ChatMessage(
+                System.currentTimeMillis(), deviceId, type, "", mime, id
+            )
+            runOnUiThread { sendMessage(message) }
+        } catch (e: Exception) {
+            runOnUiThread {
+                toast(
+                    "Lampiran gagal dikirim: ${e.message?.take(120) ?: "periksa koneksi"}"
+                )
+            }
+        }
+    }
+
+    private fun attachmentDirectory(): File {
+        return File(filesDir, "attachments").apply {
+            if (!exists() && !mkdirs()) {
+                throw IOException("Tidak bisa membuat folder lampiran")
+            }
+        }
     }
 
     private fun toggleRecording() {
@@ -613,11 +931,16 @@ class MainActivity : Activity() {
                 isRecording = false
                 updateRecordButton()
                 val file = recordingFile
+                recordingFile = null
                 if (file != null && file.exists()) {
-                    val bytes = file.readBytes()
-                    if (bytes.size > MAX_ATTACHMENT_BYTES) toast("Audio terlalu besar; coba pesan yang lebih singkat")
-                    else sendMessage(ChatMessage(System.currentTimeMillis(), deviceId, "audio", "", "audio/mp4", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)))
-                    file.delete()
+                    if (file.length() > MAX_ATTACHMENT_BYTES) {
+                        file.delete()
+                        toast("Audio melebihi batas 80 MiB")
+                    } else {
+                        sendLocalAttachment(
+                            file, "audio", "audio/mp4", deleteSource = true
+                        )
+                    }
                 }
             } catch (_: Exception) {
                 stopRecorderSilently(); toast("Rekaman tidak dapat disimpan")
@@ -636,7 +959,7 @@ class MainActivity : Activity() {
             rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             rec.setMaxDuration(60_000)
-            rec.setMaxFileSize(MAX_ATTACHMENT_BYTES.toLong())
+            rec.setMaxFileSize(MAX_ATTACHMENT_BYTES)
             rec.setOutputFile(file.absolutePath)
             rec.prepare()
             rec.start()
@@ -697,10 +1020,66 @@ class MainActivity : Activity() {
     private fun saveAttachmentToUri(uri: Uri, msg: ChatMessage) {
         Thread {
             try {
-                val bytes = android.util.Base64.decode(msg.data, android.util.Base64.DEFAULT)
-                contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("Tujuan penyimpanan tidak tersedia")
-                runOnUiThread { toast("Lampiran disimpan ke lokasi yang dipilih") }
-            } catch (e: Exception) { runOnUiThread { toast("Gagal menyimpan lampiran") } }
+                val output = contentResolver.openOutputStream(uri)
+                    ?: throw IOException("Tujuan penyimpanan tidak tersedia")
+
+                output.use { destination ->
+                    if (msg.data.matches(Regex("[a-f0-9]{32}"))) {
+                        val localFile = File(
+                            attachmentDirectory(), "${msg.data}.bin"
+                        )
+
+                        if (localFile.isFile) {
+                            localFile.inputStream().buffered().use {
+                                it.copyTo(destination)
+                            }
+                        } else {
+                            if (mode != "client") {
+                                throw IOException(
+                                    "File lampiran tidak ditemukan di HP ini"
+                                )
+                            }
+
+                            val request = Request.Builder()
+                                .url("$serverUrl/api/attachments/${msg.data}")
+                                .header("x-pair-code", pairCode)
+                                .header("x-device-id", deviceId)
+                                .get()
+                                .build()
+
+                            http.newCall(request).execute().use { response ->
+                                if (!response.isSuccessful) {
+                                    throw IOException(
+                                        "Unduh gagal (HTTP ${response.code})"
+                                    )
+                                }
+                                val body = response.body
+                                    ?: throw IOException("Isi lampiran kosong")
+                                body.byteStream().use {
+                                    it.copyTo(destination)
+                                }
+                            }
+                        }
+                    } else {
+                        // Kompatibilitas untuk pesan Base64 dari versi sebelumnya.
+                        destination.write(
+                            android.util.Base64.decode(
+                                msg.data, android.util.Base64.DEFAULT
+                            )
+                        )
+                    }
+                }
+
+                runOnUiThread {
+                    toast("Lampiran disimpan ke lokasi yang dipilih")
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    toast(
+                        "Gagal menyimpan lampiran: ${e.message?.take(100) ?: "coba lagi"}"
+                    )
+                }
+            }
         }.start()
     }
 
@@ -754,19 +1133,6 @@ class MainActivity : Activity() {
         return buildString { repeat(12) { append(chars[random.nextInt(chars.length)]) } }
     }
 
-    private fun readLimited(input: java.io.InputStream, limit: Int): ByteArray {
-        val output = java.io.ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        var total = 0
-        while (true) {
-            val count = input.read(buffer)
-            if (count < 0) break
-            total += count
-            if (total > limit) throw IOException("Lampiran terlalu besar; batas build awal ${MAX_ATTACHMENT_BYTES / 1000} KB")
-            output.write(buffer, 0, count)
-        }
-        return output.toByteArray()
-    }
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -802,7 +1168,7 @@ class MainActivity : Activity() {
     private fun field(hintText: String): EditText = EditText(this).apply {
         hint = hintText; setHintTextColor(Palette.MUTED); setTextColor(Palette.WHITE); textSize = 14f
         background = rounded(Palette.PANEL, 14, Palette.BORDER); setPadding(dp(14), dp(12), dp(14), dp(12))
-        setSingleLine(true)
+        singleLine = true
     }
 
     private fun smallButton(label: String, accent: Boolean = false, click: () -> Unit): TextView = text(label, 10, if (accent) Palette.BG else Palette.WHITE, true).apply {
