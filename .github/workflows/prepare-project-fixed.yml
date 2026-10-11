@@ -29,8 +29,7 @@ jobs:
             unzip -l berdua-source.zip
             exit 1
           fi
-          rsync -a --delete --exclude='.github/' /tmp/berdua-source/berdua-android/ ./
-          rm -f berdua-source.zip
+          rsync -a --delete --exclude='.git/' --exclude='.github/' /tmp/berdua-source/berdua-android/ ./
 
       - name: Commit source files to repository
         shell: bash
