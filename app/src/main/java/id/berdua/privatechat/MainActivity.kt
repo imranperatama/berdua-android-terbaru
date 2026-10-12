@@ -2,15 +2,18 @@ package id.berdua.privatechat
 
 import android.Manifest
 import android.app.Activity
+import android.app.Dialog
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.graphics.BitmapFactory
 import android.graphics.drawable.GradientDrawable
 import android.location.LocationManager
 import android.media.MediaRecorder
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,9 +24,12 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.ImageView
+import android.widget.MediaController
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.VideoView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
@@ -208,6 +214,202 @@ class LocalChatServer(
     private val prefs = context.getSharedPreferences(
         "berdua_pairing", Context.MODE_PRIVATE
     )
+
+    private fun audioButtonLabel(messageId: Long): String {
+        if (activeAudioMessageId != messageId) return "▶ Putar suara"
+        if (!audioPrepared) return "… Memuat suara"
+        return try {
+            if (audioPlayer?.isPlaying == true) "Ⅱ Jeda" else "▶ Lanjutkan"
+        } catch (_: Exception) {
+            "▶ Lanjutkan"
+        }
+    }
+
+    private fun refreshAudioButtons() {
+        audioButtons.forEach { (id, button) -> button.text = audioButtonLabel(id) }
+    }
+
+    private fun releaseAudioPlayer() {
+        try { audioPlayer?.release() } catch (_: Exception) { }
+        audioPlayer = null
+        audioPrepared = false
+        activeAudioMessageId = null
+    }
+
+    private fun toggleAudioPlayback(msg: ChatMessage) {
+        if (activeAudioMessageId == msg.id && audioPlayer != null) {
+            if (!audioPrepared) {
+                toast("Sedang menyiapkan audio…")
+                return
+            }
+            try {
+                val player = audioPlayer ?: return
+                if (player.isPlaying) player.pause() else player.start()
+                refreshAudioButtons()
+            } catch (_: Exception) {
+                releaseAudioPlayer()
+                refreshAudioButtons()
+                toast("Audio tidak dapat diputar")
+            }
+            return
+        }
+
+        releaseAudioPlayer()
+        activeAudioMessageId = msg.id
+        refreshAudioButtons()
+        withLocalAttachment(msg) { file ->
+            if (activeAudioMessageId != msg.id) return@withLocalAttachment
+            try {
+                val player = MediaPlayer()
+                audioPlayer = player
+                audioPrepared = false
+                player.setOnPreparedListener { prepared ->
+                    if (activeAudioMessageId == msg.id) {
+                        audioPrepared = true
+                        try { prepared.start() } catch (_: Exception) { toast("Audio gagal diputar") }
+                        refreshAudioButtons()
+                    } else {
+                        try { prepared.release() } catch (_: Exception) { }
+                    }
+                }
+                player.setOnCompletionListener {
+                    if (activeAudioMessageId == msg.id) {
+                        releaseAudioPlayer()
+                        refreshAudioButtons()
+                    }
+                }
+                player.setOnErrorListener { _, _, _ ->
+                    if (activeAudioMessageId == msg.id) {
+                        releaseAudioPlayer()
+                        refreshAudioButtons()
+                        toast("Format audio tidak didukung atau file rusak")
+                    }
+                    true
+                }
+                player.setDataSource(file.absolutePath)
+                player.prepareAsync()
+            } catch (_: Exception) {
+                releaseAudioPlayer()
+                refreshAudioButtons()
+                toast("Audio tidak dapat dibuka")
+            }
+        }
+    }
+
+    /** Download or decode one attachment to private app storage, without loading the whole file into RAM. */
+    private fun withLocalAttachment(msg: ChatMessage, onReady: (File) -> Unit) {
+        Thread {
+            try {
+                val dir = attachmentDirectory()
+                val isRemoteId = msg.data.matches(Regex("[a-f0-9]{32}"))
+                val file = File(dir, if (isRemoteId) "${msg.data}.bin" else "legacy-${msg.id}.bin")
+                if (!file.isFile || file.length() == 0L) {
+                    if (!isRemoteId) {
+                        val decoded = try {
+                            android.util.Base64.decode(msg.data, android.util.Base64.DEFAULT)
+                        } catch (_: Exception) {
+                            throw IOException("Data lampiran lama tidak valid")
+                        }
+                        if (decoded.size.toLong() > MAX_ATTACHMENT_BYTES) {
+                            throw IOException("Lampiran maksimal 80 MiB per file")
+                        }
+                        file.writeBytes(decoded)
+                    } else {
+                        if (mode != "client") {
+                            throw IOException("File lampiran belum tersedia di HP ini")
+                        }
+                        val request = Request.Builder()
+                            .url("$serverUrl/api/attachments/${msg.data}")
+                            .header("x-pair-code", pairCode)
+                            .header("x-device-id", deviceId)
+                            .get()
+                            .build()
+                        http.newCall(request).execute().use { response ->
+                            if (!response.isSuccessful) throw IOException("Unduh lampiran gagal (HTTP ${response.code})")
+                            val body = response.body ?: throw IOException("Isi lampiran kosong")
+                            body.byteStream().use { copyWithLimit(it, file) }
+                        }
+                    }
+                }
+                if (!file.isFile) throw IOException("Lampiran tidak ditemukan")
+                runOnUiThread { onReady(file) }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    if (msg.type == "audio" && activeAudioMessageId == msg.id) {
+                        releaseAudioPlayer()
+                        refreshAudioButtons()
+                    }
+                    toast("Lampiran tidak bisa dibuka: ${e.message?.take(100) ?: "coba lagi"}")
+                }
+            }
+        }.start()
+    }
+
+    private fun playVideoInChat(msg: ChatMessage) {
+        withLocalAttachment(msg) { file ->
+            try {
+                val dialog = Dialog(this)
+                val video = VideoView(this)
+                val controller = MediaController(this)
+                controller.setAnchorView(video)
+                video.setMediaController(controller)
+                video.setOnPreparedListener { player ->
+                    player.isLooping = false
+                    video.start()
+                }
+                dialog.setContentView(video)
+                dialog.setOnDismissListener { try { video.stopPlayback() } catch (_: Exception) { } }
+                dialog.show()
+                dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                video.setVideoURI(Uri.fromFile(file))
+            } catch (_: Exception) {
+                toast("Video tidak dapat diputar di perangkat ini")
+            }
+        }
+    }
+
+    private fun showImageInChat(msg: ChatMessage) {
+        withLocalAttachment(msg) { file ->
+            try {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                val maxWidth = (resources.displayMetrics.widthPixels * 1.5f).toInt().coerceAtLeast(800)
+                val maxHeight = (resources.displayMetrics.heightPixels * 1.5f).toInt().coerceAtLeast(1200)
+                var sample = 1
+                while (bounds.outWidth / sample > maxWidth || bounds.outHeight / sample > maxHeight) sample *= 2
+                val options = BitmapFactory.Options().apply { inSampleSize = sample.coerceAtLeast(1) }
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath, options)
+                    ?: throw IOException("Foto tidak bisa dibuka")
+                val image = ImageView(this).apply {
+                    setImageBitmap(bitmap)
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    setBackgroundColor(0xFF050505.toInt())
+                    adjustViewBounds = true
+                }
+                val dialog = Dialog(this)
+                dialog.setContentView(image)
+                dialog.setOnDismissListener { if (!bitmap.isRecycled) bitmap.recycle() }
+                dialog.show()
+                dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            } catch (_: Exception) {
+                toast("Foto tidak dapat dibuka")
+            }
+        }
+    }
+
+    private fun openSharedLocation(link: String) {
+        try {
+            val cleanLink = link.trim()
+            val mapUri = if (cleanLink.startsWith("https://") || cleanLink.startsWith("http://")) {
+                Uri.parse(cleanLink)
+            } else {
+                Uri.parse("geo:0,0?q=${Uri.encode(cleanLink)}")
+            }
+            startActivity(Intent(Intent.ACTION_VIEW, mapUri))
+        } catch (_: Exception) {
+            toast("Tidak ada aplikasi peta yang bisa membuka lokasi ini")
+        }
+    }
 
     private fun attachmentDirectory(): File {
         return File(context.filesDir, "attachments").apply {
@@ -422,8 +624,8 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private val http = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.MINUTES)
-        .writeTimeout(5, TimeUnit.MINUTES)
+        .readTimeout(15, TimeUnit.MINUTES)
+        .writeTimeout(15, TimeUnit.MINUTES)
         .build()
     private val prefs by lazy { getSharedPreferences("berdua_app", MODE_PRIVATE) }
     private val deviceId by lazy {
@@ -453,6 +655,10 @@ class MainActivity : Activity() {
     private var pollRunning = false
     private var externalPickerPending = false
     private var recordButton: TextView? = null
+    private var audioPlayer: MediaPlayer? = null
+    private var activeAudioMessageId: Long? = null
+    private var audioPrepared = false
+    private val audioButtons = mutableMapOf<Long, TextView>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -482,6 +688,7 @@ class MainActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         stopServer()
         stopRecorderSilently()
+        releaseAudioPlayer()
         super.onDestroy()
     }
 
@@ -512,7 +719,7 @@ class MainActivity : Activity() {
         }
         card.addView(text("Pribadi, bukan tersembunyi dari izin", 17, Palette.WHITE, true))
         card.addView(text(
-            "Pesan dan lampiran disimpan di penyimpanan internal aplikasi. Lokasi dan mikrofon hanya diminta saat tombol fiturnya dipakai. Kedua orang perlu setuju sebelum berbagi apa pun.",
+            "Pesan dan lampiran disimpan di penyimpanan internal aplikasi. Foto, video, dan audio dapat dikirim hingga 80 MiB per file. Lokasi dan mikrofon hanya diminta saat tombol fiturnya dipakai. Kedua orang perlu setuju sebelum berbagi apa pun.",
             13, Palette.MUTED, false
         ).apply { setPadding(0, dp(9), 0, dp(12)) })
         card.addView(text("Tidak ada akun atau username. Kode pasangan membatasi akses ke satu perangkat kedua.", 12, Palette.ACCENT, false))
@@ -668,14 +875,18 @@ class MainActivity : Activity() {
         }
         composerArea.addView(composer, matchWrap().apply { bottomMargin = dp(8) })
         val actions = row().apply { gravity = Gravity.CENTER_VERTICAL }
-        actions.addView(smallButton("＋ Foto") { pickMedia("image/*", "image") }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) })
-        actions.addView(smallButton("▣ Video") { pickMedia("video/*", "video") }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) })
-        val micButton = smallButton(if (isRecording) "■ Stop" else "◉ Suara") { toggleRecording() }
+        actions.addView(smallButton("＋ Foto") { pickMedia("image/*", "image") }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(6) })
+        actions.addView(smallButton("▣ Video") { pickMedia("video/*", "video") }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(6) })
+        actions.addView(smallButton("♫ Audio") { pickMedia("audio/*", "audio") }, LinearLayout.LayoutParams(0, dp(42), 1f))
+        composerArea.addView(actions, matchWrap().apply { bottomMargin = dp(6) })
+
+        val extraActions = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        val micButton = smallButton(if (isRecording) "■ Stop" else "◉ Rekam") { toggleRecording() }
         recordButton = micButton
-        actions.addView(micButton, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) })
-        actions.addView(smallButton("⌖ Lokasi") { shareLocation() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(5) })
-        actions.addView(smallButton("Kirim  ↗", true) { sendText() }, LinearLayout.LayoutParams(0, dp(42), 1.15f))
-        composerArea.addView(actions)
+        extraActions.addView(micButton, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(6) })
+        extraActions.addView(smallButton("⌖ Lokasi") { shareLocation() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(6) })
+        extraActions.addView(smallButton("Kirim ↗", true) { sendText() }, LinearLayout.LayoutParams(0, dp(42), 1f))
+        composerArea.addView(extraActions)
         root.addView(composerArea, matchWrap())
         setContentView(root)
         renderMessages()
@@ -738,6 +949,7 @@ class MainActivity : Activity() {
     private fun renderMessages(supplied: List<ChatMessage>? = null) {
         val list = messageList ?: return
         val messages = supplied ?: store?.all().orEmpty()
+        audioButtons.clear()
         list.removeAllViews()
         if (messages.isEmpty()) {
             list.addView(text("Belum ada pesan.\nKirim sapaan pertama kalau sudah siap.", 13, Palette.MUTED).apply {
@@ -755,24 +967,56 @@ class MainActivity : Activity() {
                 val label = if (mine) "KAMU" else "PERANGKAT KEDUA"
                 bubble.addView(text(label, 9, Palette.MUTED, true).apply { letterSpacing = .07f })
                 val payload = when (msg.type) {
-                    "image" -> "▧  Foto · ketuk untuk menyimpan"
-                    "video" -> "▣  Video · ketuk untuk menyimpan"
-                    "audio" -> "◉  Pesan suara · ketuk untuk menyimpan"
-                    "location" -> "⌖  Lokasi bersama\n${msg.text}"
+                    "image" -> "▧  Foto"
+                    "video" -> "▣  Video"
+                    "audio" -> if (msg.mime.startsWith("audio/voice")) "◉  Pesan suara" else "♫  Audio"
+                    "location" -> "⌖  Lokasi bersama\nKetuk untuk membuka peta"
                     else -> msg.text
                 }
-                bubble.addView(text(payload, 14, Palette.WHITE, false).apply {
+                val bodyText = text(payload, 14, if (msg.type == "location") Palette.ACCENT else Palette.WHITE, false).apply {
                     setPadding(0, dp(5), 0, dp(5))
-                    if (msg.type in listOf("image", "video", "audio") && msg.data.isNotBlank()) {
-                        setOnClickListener { askSaveAttachment(msg) }
+                    if (msg.type == "location") {
+                        isClickable = true
+                        setOnClickListener { openSharedLocation(msg.text) }
                     }
-                })
+                }
+                bubble.addView(bodyText)
+
+                when (msg.type) {
+                    "image" -> {
+                        if (msg.data.isNotBlank()) {
+                            val controls = row().apply { gravity = Gravity.CENTER_VERTICAL }
+                            controls.addView(smallButton("▧ Lihat foto") { showImageInChat(msg) }, LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(5) })
+                            controls.addView(smallButton("↓ Unduh") { askSaveAttachment(msg) }, LinearLayout.LayoutParams(0, dp(38), 1f))
+                            bubble.addView(controls)
+                        }
+                    }
+                    "video" -> {
+                        if (msg.data.isNotBlank()) {
+                            val controls = row().apply { gravity = Gravity.CENTER_VERTICAL }
+                            controls.addView(smallButton("▶ Putar") { playVideoInChat(msg) }, LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(5) })
+                            controls.addView(smallButton("↓ Unduh") { askSaveAttachment(msg) }, LinearLayout.LayoutParams(0, dp(38), 1f))
+                            bubble.addView(controls)
+                        }
+                    }
+                    "audio" -> {
+                        if (msg.data.isNotBlank()) {
+                            val controls = row().apply { gravity = Gravity.CENTER_VERTICAL }
+                            val playButton = smallButton(audioButtonLabel(msg.id)) { toggleAudioPlayback(msg) }
+                            audioButtons[msg.id] = playButton
+                            controls.addView(playButton, LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(5) })
+                            controls.addView(smallButton("↓ Unduh") { askSaveAttachment(msg) }, LinearLayout.LayoutParams(0, dp(38), 1f))
+                            bubble.addView(controls)
+                        }
+                    }
+                }
                 val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(msg.time))
-                bubble.addView(text(time, 9, Palette.MUTED).apply { gravity = Gravity.END })
+                bubble.addView(text(time, 9, Palette.MUTED).apply { gravity = Gravity.END; setPadding(0, dp(5), 0, 0) })
                 row.addView(bubble, bubbleParams)
                 list.addView(row, matchWrap())
             }
         }
+        refreshAudioButtons()
         scrollView?.post { scrollView?.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -811,7 +1055,7 @@ class MainActivity : Activity() {
         pendingMediaType = type
         val intent = Intent(Intent.ACTION_GET_CONTENT).apply { this.type = mimeType; addCategory(Intent.CATEGORY_OPENABLE) }
         externalPickerPending = true
-        startActivityForResult(Intent.createChooser(intent, if (type == "image") "Pilih foto" else "Pilih video"), REQ_PICK_MEDIA)
+        startActivityForResult(Intent.createChooser(intent, when (type) { "image" -> "Pilih foto"; "video" -> "Pilih video"; else -> "Pilih audio" }), REQ_PICK_MEDIA)
     }
 
     private fun sendPickedFile(uri: Uri) {
@@ -826,8 +1070,11 @@ class MainActivity : Activity() {
             }
 
             try {
-                val mime = contentResolver.getType(uri)
-                    ?: if (attachmentType == "video") "video/mp4" else "image/jpeg"
+                val mime = contentResolver.getType(uri) ?: when (attachmentType) {
+                    "video" -> "video/mp4"
+                    "audio" -> "audio/mp4"
+                    else -> "image/jpeg"
+                }
                 val input = contentResolver.openInputStream(uri)
                     ?: throw IOException("File tidak terbaca")
                 input.use { copyWithLimit(it, destination) }
@@ -1007,8 +1254,18 @@ class MainActivity : Activity() {
 
     private fun askSaveAttachment(msg: ChatMessage) {
         pendingSave = msg
-        val ext = when (msg.type) { "image" -> "jpg"; "video" -> "mp4"; else -> "m4a" }
         val mime = msg.mime.ifBlank { when (msg.type) { "image" -> "image/jpeg"; "video" -> "video/mp4"; else -> "audio/mp4" } }
+        val ext = when {
+            msg.type == "image" && mime.contains("png", true) -> "png"
+            msg.type == "image" && mime.contains("webp", true) -> "webp"
+            msg.type == "image" -> "jpg"
+            msg.type == "video" && mime.contains("webm", true) -> "webm"
+            msg.type == "video" -> "mp4"
+            mime.contains("mpeg", true) || mime.contains("mp3", true) -> "mp3"
+            mime.contains("wav", true) -> "wav"
+            mime.contains("ogg", true) -> "ogg"
+            else -> "m4a"
+        }
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE); type = mime
             putExtra(Intent.EXTRA_TITLE, "berdua-${msg.id}.$ext")
@@ -1030,9 +1287,8 @@ class MainActivity : Activity() {
                         )
 
                         if (localFile.isFile) {
-                            localFile.inputStream().buffered().use {
-                                it.copyTo(destination)
-                            }
+                            if (localFile.length() > MAX_ATTACHMENT_BYTES) throw IOException("Lampiran maksimal 80 MiB per file")
+                            localFile.inputStream().buffered().use { it.copyTo(destination) }
                         } else {
                             if (mode != "client") {
                                 throw IOException(
@@ -1055,8 +1311,16 @@ class MainActivity : Activity() {
                                 }
                                 val body = response.body
                                     ?: throw IOException("Isi lampiran kosong")
-                                body.byteStream().use {
-                                    it.copyTo(destination)
+                                body.byteStream().use { input ->
+                                    val buffer = ByteArray(64 * 1024)
+                                    var total = 0L
+                                    while (true) {
+                                        val count = input.read(buffer)
+                                        if (count < 0) break
+                                        total += count.toLong()
+                                        if (total > MAX_ATTACHMENT_BYTES) throw IOException("Lampiran maksimal 80 MiB per file")
+                                        destination.write(buffer, 0, count)
+                                    }
                                 }
                             }
                         }
