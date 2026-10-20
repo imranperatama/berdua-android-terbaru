@@ -1,4 +1,4 @@
-name: Prepare Berdua source from ZIP
+name: 01 - Extract NEXORA Project
 
 on:
   workflow_dispatch:
@@ -7,41 +7,41 @@ permissions:
   contents: write
 
 jobs:
-  unpack:
+  extract-project:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Check and unpack source ZIP
+      - uses: actions/checkout@v4
+      - name: Validate and extract project archive
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f "berdua-source.zip" ]; then
-            echo "Missing berdua-source.zip in repository root. Upload the ZIP first."
-            exit 1
-          fi
-          mkdir -p /tmp/berdua-source
-          unzip -q berdua-source.zip -d /tmp/berdua-source
-          if [ ! -f /tmp/berdua-source/berdua-android/settings.gradle.kts ] || [ ! -f /tmp/berdua-source/berdua-android/app/build.gradle.kts ]; then
-            echo "ZIP structure invalid: expected berdua-android/settings.gradle.kts and berdua-android/app/build.gradle.kts inside the archive."
-            echo "Archive listing:"
-            unzip -l berdua-source.zip
-            exit 1
-          fi
-          rsync -a --delete --exclude='.git/' --exclude='.github/' /tmp/berdua-source/berdua-android/ ./
-
-      - name: Commit source files to repository
+          ARCHIVE="NEXORA-Full-Project.zip"
+          test -f "$ARCHIVE" || { echo "Upload $ARCHIVE to repository root first."; exit 1; }
+          unzip -t "$ARCHIVE"
+          python3 - <<'PYCODE'
+          import zipfile
+          from pathlib import Path
+          archive=Path("NEXORA-Full-Project.zip")
+          dest=Path("/tmp/nexora-project").resolve(); dest.mkdir(parents=True,exist_ok=True)
+          required={"settings.gradle.kts","build.gradle.kts","app/build.gradle.kts","app/src/main/AndroidManifest.xml","app/src/main/java/id/berdua/privatechat/MainActivity.kt","tunnel.json","tools/termux-ngrok/setup.sh","tools/termux-ngrok/berdua-ngrok-watch.sh"}
+          with zipfile.ZipFile(archive) as z:
+            names=set(z.namelist()); missing=required-names
+            if missing: raise SystemExit("Missing files: "+", ".join(sorted(missing)))
+            for info in z.infolist():
+              target=(dest/info.filename).resolve()
+              if not target.is_relative_to(dest): raise SystemExit("Unsafe ZIP path: "+info.filename)
+              if info.filename.startswith((".git/",".github/")): raise SystemExit("Source ZIP must not contain .git or .github workflows")
+              z.extract(info,dest)
+          print("NEXORA source archive validated and extracted.")
+          PYCODE
+          rsync -a --delete --exclude='.git/' /tmp/nexora-project/ ./
+          rm -f "$ARCHIVE"
+      - name: Commit extracted source
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          if git diff --cached --quiet; then
-            echo "No source changes to commit."
-          else
-            git commit -m "Prepare Berdua Android source from ZIP"
-            git push
-          fi
-          
+          if git diff --cached --quiet; then echo "No source changes."; else git commit -m "Extract NEXORA project"; git push; fi
